@@ -29,7 +29,7 @@ from dataclasses import dataclass, field, asdict
 class PathConfig:
     """File path configurations"""
     # Input data paths
-    metadata_file: str = "data/IXI/IXI.xls"
+    metadata_file: str = "data_/IXI/IXI.xls"
     t1_root: Optional[str] = "data/IXI/IXI-T1"
     t2_root: Optional[str] = None
     flair_root: Optional[str] = None

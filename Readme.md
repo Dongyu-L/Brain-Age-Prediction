@@ -1,148 +1,118 @@
 # Brain Age Prediction Pipeline
 
-A universal deep learning pipeline for brain age prediction from structural MRI data.
+End-to-end brain age prediction from MRI data using pretrained DenseNet models.
 
-## Overview
+## Quick Start
 
-This pipeline implements an end-to-end workflow for training brain age prediction models on structural MRI data. The system is designed to work with any dataset structure without manual configuration.
+```bash
+# 1. Install dependencies
+pip install -r requirements.txt
+
+# 2. Run pipeline
+python main.py \
+    --metadata_file data/participants.csv \
+    --image_root data/T1_images \
+    --model_path models/best_model.pt \
+    --output_root results
+```
+
+## What It Does
+
+1. **Index** - Scans dataset and matches images to metadata
+2. **Preprocess** - ANTs-based brain MRI preprocessing
+3. **Split** - Stratified train/val/test split (70/15/15)
+4. **Predict** - Age prediction using pretrained model
 
 ## Requirements
 
 - Python 3.8+
 - PyTorch 2.0+
-- CUDA-compatible GPU (recommended)
+- MONAI 1.0+
+- ANTs (for preprocessing)
+- CUDA GPU (recommended)
 
-See `requirements.txt` for complete dependencies.
+## Input Data
 
-## Installation
+**Metadata file** (CSV/TSV/Excel) with columns:
+- Subject ID (e.g., `subject_id`, `participant_id`, `ID`)
+- Age (e.g., `age`, `Age`)
 
-```bash
-pip install -r requirements.txt
+Example `participants.csv`:
+```csv
+subject_id,age
+sub-001,45
+sub-002,62
+sub-003,28
 ```
 
-Or use the provided setup scripts:
-```bash
-./setup.sh      # Linux/Mac
-setup.bat       # Windows
+**MRI images** in NIfTI format (.nii/.nii.gz)
+
+Example structure:
+```
+data/
+├── participants.csv          # Your metadata file (any name)
+└── T1_images/                # Your images folder (any name)
+    ├── sub-001_T1.nii.gz
+    ├── sub-002_T1.nii.gz
+    └── sub-003_T1.nii.gz
 ```
 
-## Quick Start
-
-```bash
-# 1. Create configuration
-python main.py --create_example_config
-
-# 2. Edit configuration with your data paths
-nano example_config.yaml
-
-# 3. Run pipeline
-python main.py --config example_config.yaml --run_all
-```
-
-## Pipeline Components
-
-### 1. Data Indexing
-```bash
-python -m data.indexer \
-  --metadata_file data/IXI/IXI.xls \
-  --t1_root data/IXI/IXI-T1 \
-  --output raw_index.csv
-```
-
-### 2. Preprocessing
-```bash
-python -m data.preprocessor \
-  --input_csv raw_index.csv \
-  --output_dir preprocessed \
-  --template MNI152_T1_1mm.nii.gz
-```
-
-### 3. Dataset Splitting
-```bash
-python -m data.splitter \
-  --input_csv preprocessed/preprocessed_index.csv \
-  --output_dir splits \
-  --ratios 0.6 0.2 0.2 \
-  --stratify_age
-```
-
-### 4. Training
-```bash
-python -m training.trainer \
-  --train_csv splits/train_split.csv \
-  --val_csv splits/val_split.csv \
-  --test_csv splits/test_split.csv \
-  --output_dir experiments/exp001
-```
-
-## Configuration
-
-Configuration files use YAML format. Generate template:
-
-```bash
-python config.py --create_example --output my_config.yaml
-```
-
-Example configuration:
-```yaml
-paths:
-  metadata_file: data/IXI/IXI.xls
-  t1_root: data/IXI/IXI-T1
-  template: templates/MNI152_T1_1mm.nii.gz
-  output_root: outputs
-
-preprocessor:
-  registration_type: Rigid
-  n4_iterations: [50, 50, 50, 50]
-
-splitter:
-  train_ratio: 0.6
-  val_ratio: 0.2
-  test_ratio: 0.2
-  stratify_age: true
-
-trainer:
-  batch_size: 2
-  epochs: 500
-  lr: 0.0001
-```
-
-## Project Structure
+## Output
 
 ```
-Brain_Age_Prediction/
-├── data/               # Data processing modules
-├── training/           # Training components
-├── utils/              # Validation utilities
-├── config.py           # Configuration management
-├── main.py             # Pipeline orchestrator
-└── requirements.txt    # Dependencies
-```
-
-## Output Structure
-
-```
-outputs/
-├── raw_index.csv
+results/
+├── dataset_index.csv
 ├── preprocessed/
-│   └── preprocessed_index.csv
 ├── splits/
-│   ├── train_split.csv
-│   ├── val_split.csv
-│   └── test_split.csv
-└── experiments/
-    └── exp001/
-        ├── checkpoints/
-        ├── training_history.csv
-        └── test_results.json
+│   ├── train.csv
+│   ├── val.csv
+│   └── test.csv
+└── predictions/
+    ├── predictions_test.csv
+    └── metrics_test.csv
 ```
 
-## Validation
-
-Validate data quality at each step:
+## Command-Line Options
 
 ```bash
-python -m utils.validation --raw raw_index.csv
-python -m utils.validation --preprocessed preprocessed/preprocessed_index.csv
-python -m utils.validation --splits splits/train_split.csv splits/val_split.csv splits/test_split.csv
+--metadata_file    Path to metadata (CSV/TSV/Excel)
+--image_root       MRI images directory
+--model_path       Pretrained model (.pt file)
+--output_root      Output directory (default: results)
+--skip_existing    Skip completed steps
 ```
+
+## Example
+
+```bash
+# Example with your own data
+python main.py \
+    --metadata_file data/my_subjects.csv \
+    --image_root data/brain_scans \
+    --model_path best_model.pt \
+    --output_root my_results \
+    --skip_existing
+```
+
+## Results
+
+**Predictions** (`predictions_test.csv`):
+```csv
+ID,Age,predicted_age,age_error
+sub-001,45,47.2,-2.2
+sub-002,62,59.8,2.2
+```
+
+**Metrics** (`metrics_test.csv`):
+```csv
+split,n_samples,MAE,RMSE
+test,150,4.23,5.67
+```
+
+## Components
+
+- `main.py` - Pipeline orchestrator
+- `indexer.py` - Dataset indexing
+- `preprocessor.py` - MRI preprocessing
+- `splitter.py` - Data splitting
+
