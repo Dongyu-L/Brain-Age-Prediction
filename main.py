@@ -42,15 +42,19 @@ from monai.transforms import (
 from tqdm import tqdm
 
 
-class BrainAgeDataset(Dataset):
-    """Dataset for brain age prediction"""
+class BrainAgeInferenceDataset(Dataset):
+    """Dataset for brain age prediction inference"""
 
     def __init__(self, csv_file: str, transforms=None):
         self.data = pd.read_csv(csv_file)
         self.transforms = transforms
 
-        # Find image path column
-        self.image_col = self._find_column(['preprocessed_path', 'image_path', 't1_path', 'T1_path', 'path'])
+        # Find image path column (prioritize preprocessed paths)
+        self.image_col = self._find_column([
+            'T1_preprocessed_path', 'T2_preprocessed_path',
+            'preprocessed_path', 'image_path',
+            'T1_path', 't1_path', 'path'
+        ])
         if not self.image_col:
             raise ValueError(f"Could not find image path column in {csv_file}")
 
@@ -60,7 +64,10 @@ class BrainAgeDataset(Dataset):
     def _find_column(self, candidates):
         for col in candidates:
             if col in self.data.columns:
-                return col
+                # Check if column has valid paths
+                valid_count = (~self.data[col].isna() & (self.data[col] != '')).sum()
+                if valid_count > 0:
+                    return col
         return None
 
     def __len__(self):
@@ -70,8 +77,18 @@ class BrainAgeDataset(Dataset):
         row = self.data.iloc[idx]
         data_dict = {'image': row[self.image_col]}
 
+        # Handle age: check if column exists and value is not NaN/empty
         if self.age_col and self.age_col in row:
-            data_dict['age'] = float(row[self.age_col])
+            age_val = row[self.age_col]
+            if pd.notna(age_val) and age_val != '':
+                data_dict['age'] = float(age_val)
+                data_dict['has_age'] = True
+            else:
+                data_dict['age'] = -1.0  # placeholder
+                data_dict['has_age'] = False
+        else:
+            data_dict['age'] = -1.0
+            data_dict['has_age'] = False
 
         if self.transforms:
             data_dict = self.transforms(data_dict)
@@ -204,23 +221,32 @@ class BrainAgePipeline:
             logging.info(f"✓ Preprocessed data already exists: {output_csv}")
             return str(output_csv)
 
+        # Note: template_path should point to actual MNI152 template file
+        # Default location: templates/MNI152_T1_1mm.nii.gz
+        template_path = Path(r"T1_Template.nii\T1_Template.nii")
+        if not template_path.exists():
+            logging.warning(f"Template not found at {template_path}, using default ANTs template")
+            template_path = r"T1_Template.nii\T1_Template.nii"  # ANTs may have built-in template
+
         preprocessor = UniversalPreprocessor(
             input_csv=index_csv,
-            output_root=str(preproc_dir),
-            template='MNI152',
-            n_jobs=4,
+            output_dir=str(preproc_dir),
+            template_path=str(template_path),
             skip_existing=self.skip_existing,
         )
 
-        preprocessor.run()
+        # Run preprocessing - this generates preprocessed_index.csv automatically
+        output_df = preprocessor.run()
 
-        # Update CSV with preprocessed paths
-        df = pd.read_csv(index_csv)
-        df['preprocessed_path'] = df.apply(
-            lambda row: str(preproc_dir / f"{row['ID']}_preprocessed.nii.gz"),
-            axis=1
-        )
-        df.to_csv(output_csv, index=False)
+        # The preprocessor creates its own output CSV at preproc_dir/preprocessed_index.csv
+        generated_csv = preproc_dir / "preprocessed_index.csv"
+        if generated_csv.exists():
+            # Copy to expected location
+            import shutil
+            shutil.copy(generated_csv, output_csv)
+        else:
+            # Fallback: manually create output CSV if preprocessor didn't
+            output_df.to_csv(output_csv, index=False)
 
         logging.info(f"✓ Preprocessing completed: {output_csv}")
 
@@ -234,9 +260,10 @@ class BrainAgePipeline:
         logging.info("=" * 70)
 
         split_dir = self.output_root / "splits"
-        train_csv = split_dir / "train.csv"
-        val_csv = split_dir / "val.csv"
-        test_csv = split_dir / "test.csv"
+        # Note: UniversalSplitter generates files with _split suffix
+        train_csv = split_dir / "train_split.csv"
+        val_csv = split_dir / "val_split.csv"
+        test_csv = split_dir / "test_split.csv"
 
         if self.skip_existing and all([train_csv.exists(), val_csv.exists(), test_csv.exists()]):
             logging.info(f"✓ Splits already exist")
@@ -248,16 +275,16 @@ class BrainAgePipeline:
             train_ratio=0.7,
             val_ratio=0.15,
             test_ratio=0.15,
-            stratify_by_age=True,
-            random_seed=42,
+            stratify_age=True,  # Fixed: was stratify_by_age
+            seed=42,  # Fixed: was random_seed
         )
 
-        splitter.split()
+        splitter.run()  # Fixed: was split()
 
         logging.info(f"✓ Dataset split completed")
-        logging.info(f"  Train: {train_csv}")
-        logging.info(f"  Val: {val_csv}")
-        logging.info(f"  Test: {test_csv}")
+        logging.info(f"  Train: {train_csv} ({pd.read_csv(train_csv).__len__()} samples)")
+        logging.info(f"  Val: {val_csv} ({pd.read_csv(val_csv).__len__()} samples)")
+        logging.info(f"  Test: {test_csv} ({pd.read_csv(test_csv).__len__()} samples)")
 
         return str(train_csv), str(val_csv), str(test_csv)
 
@@ -293,12 +320,13 @@ class BrainAgePipeline:
         ])
 
         # Dataset and loader
-        dataset = BrainAgeDataset(csv_file, transforms=transforms)
+        dataset = BrainAgeInferenceDataset(csv_file, transforms=transforms)
         loader = DataLoader(dataset, batch_size=4, shuffle=False, num_workers=4)
 
         # Run predictions
         predictions = []
         true_ages = []
+        has_age_flags = []
 
         with torch.no_grad():
             for batch in tqdm(loader, desc=f"Predicting {split_name}"):
@@ -308,6 +336,8 @@ class BrainAgePipeline:
 
                 if 'age' in batch:
                     true_ages.extend(batch['age'].numpy())
+                if 'has_age' in batch:
+                    has_age_flags.extend(batch['has_age'].numpy())
 
         # Save results
         results_dir = self.output_root / "predictions"
@@ -316,28 +346,45 @@ class BrainAgePipeline:
         results_df = pd.read_csv(csv_file)
         results_df['predicted_age'] = predictions
 
-        if true_ages:
+        # Handle partial age labels
+        if true_ages and has_age_flags:
             results_df['true_age'] = true_ages
-            results_df['age_error'] = np.array(predictions) - np.array(true_ages)
+            results_df['has_age_label'] = has_age_flags
 
-            # Calculate metrics
-            mae = np.mean(np.abs(results_df['age_error']))
-            rmse = np.sqrt(np.mean(results_df['age_error']**2))
+            # Calculate error only for subjects with age labels
+            valid_mask = np.array(has_age_flags, dtype=bool)
+            results_df['age_error'] = np.where(
+                valid_mask,
+                np.array(predictions) - np.array(true_ages),
+                np.nan
+            )
 
-            logging.info(f"✓ {split_name.upper()} SET RESULTS:")
-            logging.info(f"  Subjects: {len(results_df)}")
-            logging.info(f"  MAE: {mae:.2f} years")
-            logging.info(f"  RMSE: {rmse:.2f} years")
+            # Calculate metrics only for subjects with valid age labels
+            n_with_age = valid_mask.sum()
+            if n_with_age > 0:
+                valid_errors = results_df.loc[valid_mask, 'age_error']
+                mae = np.mean(np.abs(valid_errors))
+                rmse = np.sqrt(np.mean(valid_errors**2))
 
-            # Save metrics
-            metrics = {
-                'split': split_name,
-                'n_samples': len(results_df),
-                'MAE': mae,
-                'RMSE': rmse,
-            }
-            metrics_file = results_dir / f"metrics_{split_name}.csv"
-            pd.DataFrame([metrics]).to_csv(metrics_file, index=False)
+                logging.info(f"✓ {split_name.upper()} SET RESULTS:")
+                logging.info(f"  Total subjects: {len(results_df)}")
+                logging.info(f"  Subjects with age GT: {n_with_age}")
+                logging.info(f"  Subjects without age GT: {len(results_df) - n_with_age}")
+                logging.info(f"  MAE (on {n_with_age} subjects): {mae:.2f} years")
+                logging.info(f"  RMSE (on {n_with_age} subjects): {rmse:.2f} years")
+
+                # Save metrics
+                metrics = {
+                    'split': split_name,
+                    'n_total': len(results_df),
+                    'n_with_age': n_with_age,
+                    'MAE': mae,
+                    'RMSE': rmse,
+                }
+                metrics_file = results_dir / f"metrics_{split_name}.csv"
+                pd.DataFrame([metrics]).to_csv(metrics_file, index=False)
+            else:
+                logging.info(f"✓ {split_name.upper()} SET: {len(results_df)} subjects predicted (no age GT available)")
 
         # Save predictions
         output_file = results_dir / f"predictions_{split_name}.csv"

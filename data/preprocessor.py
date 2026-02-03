@@ -350,7 +350,7 @@ class UniversalPreprocessor:
         try:
             img_n4 = ants.n4_bias_field_correction(
                 img,
-                convergence={'iters': self.n4_iterations},
+                convergence={'iters': self.n4_iterations, 'tol': 1e-7},
             )
         except Exception as e:
             raise ValueError(f"N4 correction failed: {str(e)}")

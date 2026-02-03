@@ -1,118 +1,72 @@
-# Brain Age Prediction Pipeline
+# Brain Age Prediction
 
-End-to-end brain age prediction from MRI data using pretrained DenseNet models.
+Predict brain age from MRI using pretrained DenseNet121.
 
 ## Quick Start
 
 ```bash
-# 1. Install dependencies
-pip install -r requirements.txt
+pip install -r Requirements.txt
 
-# 2. Run pipeline
 python main.py \
-    --metadata_file data/participants.csv \
-    --image_root data/T1_images \
-    --model_path models/best_model.pt \
-    --output_root results
+    --metadata_file participants.csv \
+    --image_root T1_images/ \
+    --model_path pretrained.pt
 ```
 
-## What It Does
+## Input Requirements
 
-1. **Index** - Scans dataset and matches images to metadata
-2. **Preprocess** - ANTs-based brain MRI preprocessing
-3. **Split** - Stratified train/val/test split (70/15/15)
-4. **Predict** - Age prediction using pretrained model
+| Input | Description |
+|-------|-------------|
+| Metadata file | CSV/TSV/Excel with `ID` and `Age` columns |
+| MRI images | NIfTI files (`.nii`/`.nii.gz`) |
+| Pretrained model | PyTorch checkpoint (`.pt`) |
 
-## Requirements
-
-- Python 3.8+
-- PyTorch 2.0+
-- MONAI 1.0+
-- ANTs (for preprocessing)
-- CUDA GPU (recommended)
-
-## Input Data
-
-**Metadata file** (CSV/TSV/Excel) with columns:
-- Subject ID (e.g., `subject_id`, `participant_id`, `ID`)
-- Age (e.g., `age`, `Age`)
-
-Example `participants.csv`:
+**Metadata example:**
 ```csv
-subject_id,age
+ID,Age
 sub-001,45
 sub-002,62
-sub-003,28
-```
-
-**MRI images** in NIfTI format (.nii/.nii.gz)
-
-Example structure:
-```
-data/
-├── participants.csv          # Your metadata file (any name)
-└── T1_images/                # Your images folder (any name)
-    ├── sub-001_T1.nii.gz
-    ├── sub-002_T1.nii.gz
-    └── sub-003_T1.nii.gz
 ```
 
 ## Output
 
 ```
 results/
-├── dataset_index.csv
-├── preprocessed/
+├── preprocessed/              # N4 + MNI registered images
 ├── splits/
-│   ├── train.csv
-│   ├── val.csv
-│   └── test.csv
+│   ├── train_split.csv
+│   ├── val_split.csv
+│   └── test_split.csv
 └── predictions/
-    ├── predictions_test.csv
-    └── metrics_test.csv
+    ├── predictions_*.csv      # ID, Age, predicted_age, age_error
+    └── metrics_*.csv          # MAE, RMSE
 ```
 
-## Command-Line Options
+## Arguments
 
-```bash
---metadata_file    Path to metadata (CSV/TSV/Excel)
---image_root       MRI images directory
---model_path       Pretrained model (.pt file)
---output_root      Output directory (default: results)
---skip_existing    Skip completed steps
-```
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `--metadata_file` | Yes | Metadata file path |
+| `--image_root` | Yes | MRI images directory |
+| `--model_path` | Yes | Pretrained model path |
+| `--output_root` | No | Output directory (default: `results`) |
+| `--skip_existing` | No | Skip completed steps |
 
-## Example
+## Pipeline
 
-```bash
-# Example with your own data
-python main.py \
-    --metadata_file data/my_subjects.csv \
-    --image_root data/brain_scans \
-    --model_path best_model.pt \
-    --output_root my_results \
-    --skip_existing
-```
+1. **Indexing** - Match metadata IDs with image files
+2. **Preprocessing** - N4 bias correction + MNI registration
+3. **Splitting** - Age-stratified split (70/15/15)
+4. **Prediction** - DenseNet121 inference
 
-## Results
+## Training
 
-**Predictions** (`predictions_test.csv`):
-```csv
-ID,Age,predicted_age,age_error
-sub-001,45,47.2,-2.2
-sub-002,62,59.8,2.2
-```
+To train your own model, see [training/README.md](training/README.md).
 
-**Metrics** (`metrics_test.csv`):
-```csv
-split,n_samples,MAE,RMSE
-test,150,4.23,5.67
-```
+## Requirements
 
-## Components
-
-- `main.py` - Pipeline orchestrator
-- `indexer.py` - Dataset indexing
-- `preprocessor.py` - MRI preprocessing
-- `splitter.py` - Data splitting
-
+- Python 3.8+
+- PyTorch 2.0+
+- MONAI 1.3+
+- ANTsPy 0.4+
+- CUDA GPU (recommended)

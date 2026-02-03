@@ -20,23 +20,31 @@ Usage:
 """
 
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Union
 import yaml
 from dataclasses import dataclass, field, asdict
 
 
+# Type alias for paths that can be str or Path
+PathLike = Union[str, Path]
+
+
 @dataclass
 class PathConfig:
-    """File path configurations"""
+    """File path configurations
+
+    Note: Path fields are initially strings but may be converted to Path objects
+    by Config.__post_init__() for convenience.
+    """
     # Input data paths
-    metadata_file: str = "data_/IXI/IXI.xls"
-    t1_root: Optional[str] = "data/IXI/IXI-T1"
-    t2_root: Optional[str] = None
-    flair_root: Optional[str] = None
-    template: str = "templates/MNI152_T1_1mm.nii.gz"
-    
+    metadata_file: PathLike = "data/IXI/IXI.xls"
+    t1_root: Optional[PathLike] = "data/IXI/IXI-T1"
+    t2_root: Optional[PathLike] = None
+    flair_root: Optional[PathLike] = None
+    template: PathLike = "templates/MNI152_T1_1mm.nii.gz"
+
     # Output paths
-    output_root: str = "outputs"
+    output_root: PathLike = "outputs"
     experiment_name: str = "exp001"
 
 

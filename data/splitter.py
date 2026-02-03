@@ -157,8 +157,8 @@ class UniversalSplitter:
         logging.info(f"  Found {len(self.preprocessed_cols)} preprocessed modalities:")
         for col in self.preprocessed_cols:
             modality = col.replace('_preprocessed_path', '')
-            n_complete = (self.df[col] != '').sum() + (~self.df[col].isna()).sum()
-            n_complete = min(n_complete, len(self.df))  # Cap at total
+            # Fixed: use & instead of + to correctly count non-empty and non-null values
+            n_complete = ((self.df[col] != '') & (~self.df[col].isna())).sum()
             pct = 100 * n_complete / len(self.df)
             logging.info(f"    {modality}: {n_complete}/{len(self.df)} ({pct:.1f}%)")
         

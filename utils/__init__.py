@@ -5,9 +5,24 @@ This package contains:
 - validation: Data validation and quality checks
 """
 
-# Currently empty - add imports when validation.py is implemented
-# from .validation import validate_dataset, check_image_quality
+from .validation import (
+    ValidationReport,
+    check_image_quality,
+    get_image_statistics,
+    validate_csv_structure,
+    validate_raw_data,
+    validate_preprocessed_data,
+    validate_splits,
+)
 
-__all__ = []
+__all__ = [
+    'ValidationReport',
+    'check_image_quality',
+    'get_image_statistics',
+    'validate_csv_structure',
+    'validate_raw_data',
+    'validate_preprocessed_data',
+    'validate_splits',
+]
 
 __version__ = '1.0.0'
