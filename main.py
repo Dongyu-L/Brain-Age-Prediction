@@ -37,7 +37,7 @@ from torch.utils.data import Dataset, DataLoader
 from monai.networks.nets import DenseNet121
 from monai.transforms import (
     Compose, LoadImaged, EnsureChannelFirstd, Spacingd,
-    Orientationd, ScaleIntensityRanged, CropForegroundd, EnsureTyped
+    Orientationd, ScaleIntensityRanged, CropForegroundd, EnsureTyped, Resized
 )
 from tqdm import tqdm
 
@@ -309,6 +309,7 @@ class BrainAgePipeline:
         logging.info("✓ Model loaded successfully")
 
         # Data transforms (no augmentation for inference)
+        # Must match training transforms - especially Resize to (160, 192, 160)
         transforms = Compose([
             LoadImaged(keys=['image']),
             EnsureChannelFirstd(keys=['image']),
@@ -316,6 +317,7 @@ class BrainAgePipeline:
             Orientationd(keys=['image'], axcodes='RAS'),
             ScaleIntensityRanged(keys=['image'], a_min=0, a_max=255, b_min=0.0, b_max=1.0, clip=True),
             CropForegroundd(keys=['image'], source_key='image'),
+            Resized(keys=['image'], spatial_size=(160, 192, 160), mode='trilinear'),
             EnsureTyped(keys=['image']),
         ])
 
