@@ -40,7 +40,10 @@ from monai.networks.nets import DenseNet121
 from monai.utils import set_determinism
 
 # Import dataset from separate module
-from .dataset import BrainAgeDataset
+try:
+    from .dataset import BrainAgeDataset
+except ImportError:
+    from dataset import BrainAgeDataset
 
 
 class MultiTaskBrainModel(nn.Module):
@@ -82,11 +85,9 @@ class MultiTaskBrainModel(nn.Module):
         self.age_head = nn.Linear(backbone_features, 1)
 
         # Gender classification head (binary: 0=Female, 1=Male)
+        # Note: No Sigmoid here - use BCEWithLogitsLoss for AMP compatibility
         if predict_gender:
-            self.gender_head = nn.Sequential(
-                nn.Linear(backbone_features, 1),
-                nn.Sigmoid()
-            )
+            self.gender_head = nn.Linear(backbone_features, 1)
 
     def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
@@ -376,8 +377,8 @@ class BrainAgeTrainer:
         logging.info(f"Age loss: L1Loss (MAE)")
 
         if use_multitask:
-            self.gender_criterion = nn.BCELoss()  # Binary cross-entropy for gender
-            logging.info(f"Gender loss: BCELoss (Binary Cross-Entropy)")
+            self.gender_criterion = nn.BCEWithLogitsLoss()  # AMP-safe binary cross-entropy
+            logging.info(f"Gender loss: BCEWithLogitsLoss")
 
         # Optimizer
         self.optimizer = torch.optim.AdamW(
@@ -393,7 +394,6 @@ class BrainAgeTrainer:
             mode='min',
             patience=self.lr_scheduler_patience,
             factor=0.5,
-            verbose=True,
         )
         logging.info(f"LR Scheduler: ReduceLROnPlateau (patience={self.lr_scheduler_patience})")
 
@@ -455,8 +455,8 @@ class BrainAgeTrainer:
                         valid_gender_true = gender[valid_gender_mask]
                         gender_loss = self.gender_criterion(valid_gender_pred, valid_gender_true)
 
-                        # Calculate accuracy
-                        gender_preds_binary = (valid_gender_pred > 0.5).float()
+                        # Calculate accuracy (logits > 0 means prob > 0.5)
+                        gender_preds_binary = (valid_gender_pred > 0).float()
                         total_gender_correct += (gender_preds_binary == valid_gender_true).sum().item()
                         total_gender_samples += valid_gender_mask.sum().item()
                     else:
@@ -541,8 +541,8 @@ class BrainAgeTrainer:
                             valid_gender_true = gender[valid_gender_mask]
                             gender_loss = self.gender_criterion(valid_gender_pred, valid_gender_true)
 
-                            # Calculate accuracy
-                            gender_preds_binary = (valid_gender_pred > 0.5).float()
+                            # Calculate accuracy (logits > 0 means prob > 0.5)
+                            gender_preds_binary = (valid_gender_pred > 0).float()
                             total_gender_correct += (gender_preds_binary == valid_gender_true).sum().item()
                             total_gender_samples += valid_gender_mask.sum().item()
                         else:
