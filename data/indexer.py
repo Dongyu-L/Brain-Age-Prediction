@@ -32,10 +32,15 @@ import pandas as pd
 
 class UniversalIndexer:
     """Universal indexer for MRI datasets"""
-    
+
     # Common column name patterns for fuzzy matching
     ID_PATTERNS = ['id', 'patient', 'subject', 'participant', 'sub', 'case']
     AGE_PATTERNS = ['age', 'anos', 'alter', 'yas']
+    GENDER_PATTERNS = ['sex', 'gender', 'male', 'female', 'geschlecht', 'sexo']
+
+    # Gender value mappings (normalize to 0=Female, 1=Male)
+    GENDER_MALE_VALUES = ['m', 'male', '1', 'man', 'männlich', 'masculino', 'homme']
+    GENDER_FEMALE_VALUES = ['f', 'female', '2', 'woman', 'weiblich', 'femenino', 'femme', '0']
     
     # Common filename patterns for ID extraction
     FILENAME_PATTERNS = [
@@ -49,14 +54,15 @@ class UniversalIndexer:
     # Valid image extensions
     IMAGE_EXTENSIONS = ['.nii', '.nii.gz', '.nrrd', '.mha', '.mhd']
     
-    def __init__(self, 
+    def __init__(self,
                  metadata_file: str,
                  image_roots: Dict[str, str],
                  output_csv: str,
                  recursive: bool = True,
                  min_age: float = 0.0,
                  max_age: float = 120.0,
-                 require_all_modalities: bool = False):
+                 require_all_modalities: bool = False,
+                 extract_gender: bool = True):
         """
         Args:
             metadata_file: Path to metadata file (Excel/CSV/TSV/JSON)
@@ -66,6 +72,7 @@ class UniversalIndexer:
             min_age: Minimum valid age
             max_age: Maximum valid age
             require_all_modalities: If True, only include subjects with all modalities
+            extract_gender: Whether to extract gender information from metadata
         """
         self.metadata_file = Path(metadata_file)
         self.image_roots = {k: Path(v) for k, v in image_roots.items()}
@@ -74,10 +81,12 @@ class UniversalIndexer:
         self.min_age = min_age
         self.max_age = max_age
         self.require_all_modalities = require_all_modalities
-        
+        self.extract_gender = extract_gender
+
         self.metadata_df: Optional[pd.DataFrame] = None
         self.id_col: Optional[str] = None
         self.age_col: Optional[str] = None
+        self.gender_col: Optional[str] = None
         
     def create_index(self) -> pd.DataFrame:
         """Main pipeline: load, match, validate, save"""
@@ -148,7 +157,7 @@ class UniversalIndexer:
         """Auto-detect ID and Age columns with fuzzy matching"""
         id_col = self._fuzzy_find_column(self.metadata_df.columns, self.ID_PATTERNS)
         age_col = self._fuzzy_find_column(self.metadata_df.columns, self.AGE_PATTERNS)
-        
+
         if not id_col:
             raise ValueError(
                 f"Could not auto-detect ID column in metadata.\n"
@@ -156,7 +165,7 @@ class UniversalIndexer:
                 f"Suggestion: Ensure metadata has a column containing 'id', 'patient', 'subject', or 'participant'.\n"
                 f"Or manually specify with --id_column argument."
             )
-        
+
         if not age_col:
             raise ValueError(
                 f"Could not auto-detect Age column in metadata.\n"
@@ -164,7 +173,7 @@ class UniversalIndexer:
                 f"Suggestion: Ensure metadata has a column containing 'age'.\n"
                 f"Or manually specify with --age_column argument."
             )
-        
+
         # Validate Age column is numeric
         try:
             pd.to_numeric(self.metadata_df[age_col], errors='coerce')
@@ -173,8 +182,47 @@ class UniversalIndexer:
                 f"Age column '{age_col}' contains non-numeric values.\n"
                 f"Suggestion: Clean the age data or specify a different column."
             )
-        
+
+        # Detect gender column (optional)
+        if self.extract_gender:
+            gender_col = self._fuzzy_find_column(self.metadata_df.columns, self.GENDER_PATTERNS)
+            if gender_col:
+                self.gender_col = gender_col
+                logging.info(f"Detected gender column: '{gender_col}'")
+            else:
+                logging.warning(
+                    f"Could not auto-detect Gender column in metadata.\n"
+                    f"Available columns: {list(self.metadata_df.columns)}\n"
+                    f"Gender prediction will not be available for this dataset."
+                )
+
         return id_col, age_col
+
+    def _normalize_gender(self, value) -> Optional[int]:
+        """
+        Normalize gender value to binary format.
+        Returns: 0 for Female, 1 for Male, None if unknown
+        """
+        if pd.isna(value):
+            return None
+
+        value_str = str(value).lower().strip()
+
+        if value_str in self.GENDER_MALE_VALUES:
+            return 1
+        elif value_str in self.GENDER_FEMALE_VALUES:
+            return 0
+        else:
+            # Try numeric interpretation
+            try:
+                num_val = float(value_str)
+                if num_val == 1:
+                    return 1  # Male
+                elif num_val == 2 or num_val == 0:
+                    return 0  # Female
+            except ValueError:
+                pass
+            return None
     
     def _fuzzy_find_column(self, columns: List[str], patterns: List[str]) -> Optional[str]:
         """Fuzzy match column names (case-insensitive, ignore separators)"""
@@ -304,28 +352,40 @@ class UniversalIndexer:
     def _match_and_merge(self, image_maps: Dict[str, Dict[str, str]]) -> pd.DataFrame:
         """Match metadata IDs with image files and merge into single dataframe"""
         logging.info("Matching IDs between metadata and images...")
-        
+
         records = []
         match_stats = {mod: {'matched': 0, 'missing': 0} for mod in image_maps.keys()}
-        
+        gender_stats = {'male': 0, 'female': 0, 'unknown': 0}
+
         for idx, row in self.metadata_df.iterrows():
             raw_id = str(row[self.id_col]).strip()
             age = row[self.age_col]
-            
+
             # Generate ID variants for this subject
             id_variants = self._generate_id_variants(raw_id)
-            
+
             # Try to find images for each modality
             record = {
                 'ID': raw_id,
                 'Age': age,
             }
-            
+
+            # Extract gender if available
+            if self.gender_col and self.gender_col in row:
+                gender = self._normalize_gender(row[self.gender_col])
+                record['Gender'] = gender if gender is not None else -1  # -1 for unknown
+                if gender == 1:
+                    gender_stats['male'] += 1
+                elif gender == 0:
+                    gender_stats['female'] += 1
+                else:
+                    gender_stats['unknown'] += 1
+
             match_confidence = 'high'
-            
+
             for modality, file_map in image_maps.items():
                 col_name = f'{modality}_path'
-                
+
                 # Try all ID variants
                 matched_path = None
                 for variant in id_variants:
@@ -333,14 +393,14 @@ class UniversalIndexer:
                         matched_path = file_map[variant]
                         match_stats[modality]['matched'] += 1
                         break
-                
+
                 if matched_path:
                     record[col_name] = matched_path
                 else:
                     record[col_name] = ''
                     match_stats[modality]['missing'] += 1
                     match_confidence = 'low'
-            
+
             record['match_confidence'] = match_confidence
             records.append(record)
         
@@ -350,7 +410,16 @@ class UniversalIndexer:
             total = stats['matched'] + stats['missing']
             pct = 100 * stats['matched'] / total if total > 0 else 0
             logging.info(f"  {modality}: {stats['matched']}/{total} matched ({pct:.1f}%)")
-        
+
+        # Log gender statistics if extracted
+        if self.gender_col:
+            total_gender = sum(gender_stats.values())
+            logging.info("Gender statistics:")
+            logging.info(f"  Male: {gender_stats['male']}/{total_gender} ({100*gender_stats['male']/total_gender:.1f}%)")
+            logging.info(f"  Female: {gender_stats['female']}/{total_gender} ({100*gender_stats['female']/total_gender:.1f}%)")
+            if gender_stats['unknown'] > 0:
+                logging.info(f"  Unknown: {gender_stats['unknown']}/{total_gender} ({100*gender_stats['unknown']/total_gender:.1f}%)")
+
         result_df = pd.DataFrame(records)
         
         # Filter by modality requirements
@@ -485,6 +554,9 @@ Examples:
     # Optional arguments
     parser.add_argument('--id_column', help='Override auto-detected ID column name')
     parser.add_argument('--age_column', help='Override auto-detected Age column name')
+    parser.add_argument('--gender_column', help='Override auto-detected Gender column name')
+    parser.add_argument('--no_gender', action='store_true',
+                        help='Do not extract gender information')
     parser.add_argument('--recursive', action='store_true', default=True,
                         help='Recursively search subdirectories (default: True)')
     parser.add_argument('--no_recursive', action='store_false', dest='recursive',
@@ -528,13 +600,16 @@ Examples:
         min_age=args.min_age,
         max_age=args.max_age,
         require_all_modalities=args.require_all_modalities,
+        extract_gender=not args.no_gender,
     )
-    
+
     # Override column detection if specified
     if args.id_column:
         indexer.ID_PATTERNS = [args.id_column.lower()]
     if args.age_column:
         indexer.AGE_PATTERNS = [args.age_column.lower()]
+    if args.gender_column:
+        indexer.GENDER_PATTERNS = [args.gender_column.lower()]
     
     # Run indexer
     try:

@@ -56,7 +56,8 @@ class IndexerConfig:
     min_age: float = 0.0
     max_age: float = 120.0
     require_all_modalities: bool = False
-    
+    extract_gender: bool = True  # Whether to extract gender from metadata
+
     def to_dict(self) -> Dict:
         return asdict(self)
 
@@ -106,8 +107,13 @@ class ModelConfig:
     model_name: str = "DenseNet121"
     spatial_dims: int = 3
     in_channels: int = 1
-    out_channels: int = 1  # Regression
+    out_channels: int = 1  # Regression (for age)
     pretrained: bool = False
+
+    # Multi-task learning settings
+    predict_gender: bool = True  # Whether to predict gender
+    gender_loss_weight: float = 0.5  # Weight for gender loss in total loss
+    backbone_features: int = 1024  # Number of features from backbone (DenseNet121 default)
 
 
 @dataclass
@@ -437,6 +443,7 @@ indexer:
   min_age: 0.0                          # Minimum valid age
   max_age: 120.0                        # Maximum valid age
   require_all_modalities: false          # Require all modalities present
+  extract_gender: true                   # Extract gender from metadata
 
 # ==================== Preprocessor Configuration ====================
 preprocessor:
@@ -463,8 +470,11 @@ model:
   model_name: DenseNet121               # Model architecture
   spatial_dims: 3                       # 3D images
   in_channels: 1                        # Single modality input
-  out_channels: 1                       # Regression output
+  out_channels: 1                       # Regression output (for age)
   pretrained: false                     # Use pretrained weights
+  predict_gender: true                  # Enable gender prediction (multi-task)
+  gender_loss_weight: 0.5               # Weight for gender classification loss
+  backbone_features: 1024               # Features from backbone for task heads
 
 # ==================== Trainer Configuration ====================
 trainer:

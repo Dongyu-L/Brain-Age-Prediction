@@ -43,6 +43,79 @@ from monai.utils import set_determinism
 from .dataset import BrainAgeDataset
 
 
+class MultiTaskBrainModel(nn.Module):
+    """
+    Multi-task model for brain age prediction and gender classification.
+
+    Architecture:
+        - Shared backbone: DenseNet121 (3D)
+        - Age head: Linear layer for regression
+        - Gender head: Linear layer + Sigmoid for binary classification
+    """
+
+    def __init__(
+        self,
+        spatial_dims: int = 3,
+        in_channels: int = 1,
+        backbone_features: int = 1024,
+        predict_gender: bool = True,
+    ):
+        """
+        Args:
+            spatial_dims: Number of spatial dimensions (3 for 3D images)
+            in_channels: Number of input channels
+            backbone_features: Number of features from backbone
+            predict_gender: Whether to include gender prediction head
+        """
+        super().__init__()
+
+        self.predict_gender = predict_gender
+
+        # Shared backbone - DenseNet121 outputs backbone_features features
+        self.backbone = DenseNet121(
+            spatial_dims=spatial_dims,
+            in_channels=in_channels,
+            out_channels=backbone_features,
+        )
+
+        # Age regression head
+        self.age_head = nn.Linear(backbone_features, 1)
+
+        # Gender classification head (binary: 0=Female, 1=Male)
+        if predict_gender:
+            self.gender_head = nn.Sequential(
+                nn.Linear(backbone_features, 1),
+                nn.Sigmoid()
+            )
+
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Forward pass.
+
+        Args:
+            x: Input tensor of shape [B, C, H, W, D]
+
+        Returns:
+            Dictionary with keys:
+                - 'age': Age predictions [B, 1]
+                - 'gender': Gender predictions [B, 1] (if predict_gender=True)
+        """
+        # Shared features
+        features = self.backbone(x)
+
+        # Age prediction
+        age_pred = self.age_head(features)
+
+        outputs = {'age': age_pred}
+
+        # Gender prediction (if enabled)
+        if self.predict_gender:
+            gender_pred = self.gender_head(features)
+            outputs['gender'] = gender_pred
+
+        return outputs
+
+
 class EarlyStopping:
     """Early stopping to prevent overfitting"""
     
@@ -81,8 +154,8 @@ class EarlyStopping:
 
 
 class BrainAgeTrainer:
-    """Universal brain age prediction trainer"""
-    
+    """Universal brain age prediction trainer with multi-task support"""
+
     def __init__(
         self,
         train_csv: str,
@@ -99,6 +172,8 @@ class BrainAgeTrainer:
         early_stopping_patience: int = 15,
         lr_scheduler_patience: int = 5,
         seed: int = 42,
+        predict_gender: bool = True,
+        gender_loss_weight: float = 0.5,
     ):
         """
         Args:
@@ -116,6 +191,8 @@ class BrainAgeTrainer:
             early_stopping_patience: Patience for early stopping
             lr_scheduler_patience: Patience for learning rate scheduler
             seed: Random seed for reproducibility
+            predict_gender: Whether to enable gender prediction (multi-task)
+            gender_loss_weight: Weight for gender classification loss
         """
         self.train_csv = Path(train_csv)
         self.val_csv = Path(val_csv)
@@ -131,12 +208,14 @@ class BrainAgeTrainer:
         self.early_stopping_patience = early_stopping_patience
         self.lr_scheduler_patience = lr_scheduler_patience
         self.seed = seed
-        
+        self.predict_gender = predict_gender
+        self.gender_loss_weight = gender_loss_weight
+
         # Setup
         self._setup_output_dir()
         self._setup_device()
         self._set_seed()
-        
+
         # To be initialized
         self.train_loader: Optional[DataLoader] = None
         self.val_loader: Optional[DataLoader] = None
@@ -144,13 +223,20 @@ class BrainAgeTrainer:
         self.model: Optional[nn.Module] = None
         self.optimizer: Optional[torch.optim.Optimizer] = None
         self.scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None
-        self.criterion: Optional[nn.Module] = None
+        self.age_criterion: Optional[nn.Module] = None
+        self.gender_criterion: Optional[nn.Module] = None
         self.scaler: Optional[torch.cuda.amp.GradScaler] = None
         self.early_stopping: Optional[EarlyStopping] = None
-        
+
         # Training history
         self.train_losses: List[float] = []
         self.val_losses: List[float] = []
+        self.train_age_losses: List[float] = []
+        self.train_gender_losses: List[float] = []
+        self.val_age_losses: List[float] = []
+        self.val_gender_losses: List[float] = []
+        self.train_gender_accs: List[float] = []
+        self.val_gender_accs: List[float] = []
         self.best_val_loss: float = float('inf')
         self.start_epoch: int = 1
     
@@ -192,24 +278,34 @@ class BrainAgeTrainer:
         logging.info("=" * 60)
         logging.info("Setting up datasets")
         logging.info("=" * 60)
-        
+
         # Create datasets
         train_ds = BrainAgeDataset(
             csv_path=str(self.train_csv),
             target_size=self.target_size,
             modality=self.modality,
+            predict_gender=self.predict_gender,
         )
         val_ds = BrainAgeDataset(
             csv_path=str(self.val_csv),
             target_size=self.target_size,
             modality=self.modality,
+            predict_gender=self.predict_gender,
         )
         test_ds = BrainAgeDataset(
             csv_path=str(self.test_csv),
             target_size=self.target_size,
             modality=self.modality,
+            predict_gender=self.predict_gender,
         )
-        
+
+        # Check if gender data is actually available
+        self.has_gender_data = train_ds.has_gender and self.predict_gender
+        if self.predict_gender and not train_ds.has_gender:
+            logging.warning("Gender prediction enabled but no gender data found in CSV. "
+                          "Training will proceed with age prediction only.")
+            self.predict_gender = False
+
         # Create dataloaders
         self.train_loader = DataLoader(
             train_ds,
@@ -232,10 +328,11 @@ class BrainAgeTrainer:
             num_workers=self.num_workers,
             pin_memory=True,
         )
-        
+
         logging.info(f"Train batches: {len(self.train_loader)}")
         logging.info(f"Val batches: {len(self.val_loader)}")
         logging.info(f"Test batches: {len(self.test_loader)}")
+        logging.info(f"Multi-task (gender prediction): {self.has_gender_data}")
     
     def setup_model(self) -> None:
         """Setup model, optimizer, scheduler, and loss"""
@@ -243,25 +340,45 @@ class BrainAgeTrainer:
         logging.info("=" * 60)
         logging.info("Setting up model")
         logging.info("=" * 60)
-        
-        # Model
-        self.model = DenseNet121(
-            spatial_dims=3,
-            in_channels=1,
-            out_channels=1,  # Regression
-        ).to(self.device)
-        
+
+        # Check if we should use multi-task model
+        use_multitask = self.predict_gender and self.has_gender_data
+
+        if use_multitask:
+            # Multi-task model for age + gender prediction
+            self.model = MultiTaskBrainModel(
+                spatial_dims=3,
+                in_channels=1,
+                backbone_features=1024,
+                predict_gender=True,
+            ).to(self.device)
+            logging.info(f"Model: MultiTaskBrainModel (DenseNet121 backbone)")
+            logging.info(f"  Tasks: Age regression + Gender classification")
+            logging.info(f"  Gender loss weight: {self.gender_loss_weight}")
+        else:
+            # Single-task model for age prediction only
+            self.model = DenseNet121(
+                spatial_dims=3,
+                in_channels=1,
+                out_channels=1,  # Regression
+            ).to(self.device)
+            logging.info(f"Model: DenseNet121 (single-task)")
+            logging.info(f"  Task: Age regression only")
+
         # Count parameters
         n_params = sum(p.numel() for p in self.model.parameters())
         n_trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        logging.info(f"Model: DenseNet121")
         logging.info(f"Total parameters: {n_params:,}")
         logging.info(f"Trainable parameters: {n_trainable:,}")
-        
-        # Loss
-        self.criterion = nn.L1Loss()
-        logging.info(f"Loss function: L1Loss (MAE)")
-        
+
+        # Loss functions
+        self.age_criterion = nn.L1Loss()  # MAE for age regression
+        logging.info(f"Age loss: L1Loss (MAE)")
+
+        if use_multitask:
+            self.gender_criterion = nn.BCELoss()  # Binary cross-entropy for gender
+            logging.info(f"Gender loss: BCELoss (Binary Cross-Entropy)")
+
         # Optimizer
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
@@ -269,7 +386,7 @@ class BrainAgeTrainer:
             weight_decay=self.weight_decay,
         )
         logging.info(f"Optimizer: AdamW (lr={self.lr}, weight_decay={self.weight_decay})")
-        
+
         # Scheduler
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer,
@@ -279,10 +396,10 @@ class BrainAgeTrainer:
             verbose=True,
         )
         logging.info(f"LR Scheduler: ReduceLROnPlateau (patience={self.lr_scheduler_patience})")
-        
+
         # AMP scaler
         self.scaler = torch.cuda.amp.GradScaler()
-        
+
         # Early stopping
         self.early_stopping = EarlyStopping(
             patience=self.early_stopping_patience,
@@ -291,57 +408,171 @@ class BrainAgeTrainer:
         )
         logging.info(f"Early stopping patience: {self.early_stopping_patience}")
     
-    def train_epoch(self, epoch: int) -> float:
-        """Train for one epoch"""
+    def train_epoch(self, epoch: int) -> Dict[str, float]:
+        """Train for one epoch with multi-task support"""
         self.model.train()
         total_loss = 0.0
-        
+        total_age_loss = 0.0
+        total_gender_loss = 0.0
+        total_gender_correct = 0
+        total_gender_samples = 0
+
+        use_multitask = self.predict_gender and self.has_gender_data
+
         loop = tqdm(
             self.train_loader,
             desc=f"Epoch {epoch}/{self.epochs}",
             leave=False,
         )
-        
-        for x, age in loop:
+
+        for batch in loop:
+            if use_multitask:
+                x, age, gender = batch
+                gender = gender.to(self.device)
+            else:
+                x, age = batch
+                gender = None
+
             x = x.to(self.device)
             age = age.to(self.device)
-            
+
             self.optimizer.zero_grad()
-            
+
             # Forward pass with AMP
             with torch.cuda.amp.autocast():
-                pred = self.model(x)
-                loss = self.criterion(pred, age)
-            
+                if use_multitask:
+                    outputs = self.model(x)
+                    age_pred = outputs['age']
+                    gender_pred = outputs['gender']
+
+                    # Age loss
+                    age_loss = self.age_criterion(age_pred, age)
+
+                    # Gender loss (only for valid gender labels, i.e., gender >= 0)
+                    valid_gender_mask = gender.squeeze() >= 0
+                    if valid_gender_mask.sum() > 0:
+                        valid_gender_pred = gender_pred[valid_gender_mask]
+                        valid_gender_true = gender[valid_gender_mask]
+                        gender_loss = self.gender_criterion(valid_gender_pred, valid_gender_true)
+
+                        # Calculate accuracy
+                        gender_preds_binary = (valid_gender_pred > 0.5).float()
+                        total_gender_correct += (gender_preds_binary == valid_gender_true).sum().item()
+                        total_gender_samples += valid_gender_mask.sum().item()
+                    else:
+                        gender_loss = torch.tensor(0.0, device=self.device)
+
+                    # Combined loss
+                    loss = age_loss + self.gender_loss_weight * gender_loss
+                    total_age_loss += age_loss.item() * x.size(0)
+                    total_gender_loss += gender_loss.item() * valid_gender_mask.sum().item() if valid_gender_mask.sum() > 0 else 0
+                else:
+                    pred = self.model(x)
+                    loss = self.age_criterion(pred, age)
+                    total_age_loss += loss.item() * x.size(0)
+
             # Backward pass
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
             self.scaler.update()
-            
+
             total_loss += loss.item() * x.size(0)
-            loop.set_postfix({"loss": loss.item()})
-        
-        avg_loss = total_loss / len(self.train_loader.dataset)
-        return avg_loss
+
+            if use_multitask:
+                loop.set_postfix({
+                    "loss": loss.item(),
+                    "age": age_loss.item(),
+                    "gender": gender_loss.item()
+                })
+            else:
+                loop.set_postfix({"loss": loss.item()})
+
+        n_samples = len(self.train_loader.dataset)
+        metrics = {
+            'total_loss': total_loss / n_samples,
+            'age_loss': total_age_loss / n_samples,
+        }
+
+        if use_multitask and total_gender_samples > 0:
+            metrics['gender_loss'] = total_gender_loss / total_gender_samples
+            metrics['gender_acc'] = total_gender_correct / total_gender_samples
+        elif use_multitask:
+            metrics['gender_loss'] = 0.0
+            metrics['gender_acc'] = 0.0
+
+        return metrics
     
-    def evaluate(self, loader: DataLoader) -> float:
-        """Evaluate on a dataloader"""
+    def evaluate(self, loader: DataLoader) -> Dict[str, float]:
+        """Evaluate on a dataloader with multi-task support"""
         self.model.eval()
         total_loss = 0.0
-        
+        total_age_loss = 0.0
+        total_gender_loss = 0.0
+        total_gender_correct = 0
+        total_gender_samples = 0
+
+        use_multitask = self.predict_gender and self.has_gender_data
+
         with torch.no_grad():
-            for x, age in loader:
+            for batch in loader:
+                if use_multitask:
+                    x, age, gender = batch
+                    gender = gender.to(self.device)
+                else:
+                    x, age = batch
+                    gender = None
+
                 x = x.to(self.device)
                 age = age.to(self.device)
-                
+
                 with torch.cuda.amp.autocast():
-                    pred = self.model(x)
-                    loss = self.criterion(pred, age)
-                
+                    if use_multitask:
+                        outputs = self.model(x)
+                        age_pred = outputs['age']
+                        gender_pred = outputs['gender']
+
+                        # Age loss
+                        age_loss = self.age_criterion(age_pred, age)
+
+                        # Gender loss (only for valid gender labels)
+                        valid_gender_mask = gender.squeeze() >= 0
+                        if valid_gender_mask.sum() > 0:
+                            valid_gender_pred = gender_pred[valid_gender_mask]
+                            valid_gender_true = gender[valid_gender_mask]
+                            gender_loss = self.gender_criterion(valid_gender_pred, valid_gender_true)
+
+                            # Calculate accuracy
+                            gender_preds_binary = (valid_gender_pred > 0.5).float()
+                            total_gender_correct += (gender_preds_binary == valid_gender_true).sum().item()
+                            total_gender_samples += valid_gender_mask.sum().item()
+                        else:
+                            gender_loss = torch.tensor(0.0, device=self.device)
+
+                        # Combined loss
+                        loss = age_loss + self.gender_loss_weight * gender_loss
+                        total_age_loss += age_loss.item() * x.size(0)
+                        total_gender_loss += gender_loss.item() * valid_gender_mask.sum().item() if valid_gender_mask.sum() > 0 else 0
+                    else:
+                        pred = self.model(x)
+                        loss = self.age_criterion(pred, age)
+                        total_age_loss += loss.item() * x.size(0)
+
                 total_loss += loss.item() * x.size(0)
-        
-        avg_loss = total_loss / len(loader.dataset)
-        return avg_loss
+
+        n_samples = len(loader.dataset)
+        metrics = {
+            'total_loss': total_loss / n_samples,
+            'age_loss': total_age_loss / n_samples,
+        }
+
+        if use_multitask and total_gender_samples > 0:
+            metrics['gender_loss'] = total_gender_loss / total_gender_samples
+            metrics['gender_acc'] = total_gender_correct / total_gender_samples
+        elif use_multitask:
+            metrics['gender_loss'] = 0.0
+            metrics['gender_acc'] = 0.0
+
+        return metrics
     
     def save_checkpoint(self, epoch: int, is_best: bool = False) -> None:
         """Save checkpoint"""
@@ -360,18 +591,21 @@ class BrainAgeTrainer:
                 'lr': self.lr,
                 'weight_decay': self.weight_decay,
                 'seed': self.seed,
+                'predict_gender': self.predict_gender,
+                'gender_loss_weight': self.gender_loss_weight,
+                'has_gender_data': self.has_gender_data if hasattr(self, 'has_gender_data') else False,
             }
         }
-        
+
         # Save last checkpoint
         last_path = self.checkpoint_dir / "last_checkpoint.pt"
         torch.save(checkpoint, last_path)
-        
+
         # Save best checkpoint
         if is_best:
             best_path = self.checkpoint_dir / "best_checkpoint.pt"
             torch.save(checkpoint, best_path)
-            logging.info(f"New best model saved (Val MAE={self.val_losses[-1]:.3f})")
+            logging.info(f"New best model saved (Val Loss={self.val_losses[-1]:.3f})")
     
     def load_checkpoint(self, checkpoint_path: str) -> None:
         """Load checkpoint for resuming training"""
@@ -412,52 +646,74 @@ class BrainAgeTrainer:
             else:
                 logging.warning("Resume requested but no checkpoint found. Starting from scratch.")
         
+        use_multitask = self.predict_gender and self.has_gender_data
+
         # Training loop
         for epoch in range(self.start_epoch, self.epochs + 1):
-            train_loss = self.train_epoch(epoch)
-            val_loss = self.evaluate(self.val_loader)
-            
+            train_metrics = self.train_epoch(epoch)
+            val_metrics = self.evaluate(self.val_loader)
+
+            train_loss = train_metrics['total_loss']
+            val_loss = val_metrics['total_loss']
+
             self.train_losses.append(train_loss)
             self.val_losses.append(val_loss)
-            
+            self.train_age_losses.append(train_metrics['age_loss'])
+            self.val_age_losses.append(val_metrics['age_loss'])
+
+            if use_multitask:
+                self.train_gender_losses.append(train_metrics.get('gender_loss', 0))
+                self.val_gender_losses.append(val_metrics.get('gender_loss', 0))
+                self.train_gender_accs.append(train_metrics.get('gender_acc', 0))
+                self.val_gender_accs.append(val_metrics.get('gender_acc', 0))
+
             # Update scheduler
             self.scheduler.step(val_loss)
             current_lr = self.optimizer.param_groups[0]['lr']
-            
+
             # Log
-            logging.info(
-                f"Epoch {epoch}: "
-                f"Train MAE={train_loss:.3f}, "
-                f"Val MAE={val_loss:.3f}, "
-                f"LR={current_lr:.2e}"
-            )
-            
+            if use_multitask:
+                logging.info(
+                    f"Epoch {epoch}: "
+                    f"Train Loss={train_loss:.3f} (Age={train_metrics['age_loss']:.3f}, Gender={train_metrics.get('gender_loss', 0):.3f}), "
+                    f"Val Loss={val_loss:.3f} (Age={val_metrics['age_loss']:.3f}, Gender={val_metrics.get('gender_loss', 0):.3f}), "
+                    f"Gender Acc: Train={train_metrics.get('gender_acc', 0)*100:.1f}%, Val={val_metrics.get('gender_acc', 0)*100:.1f}%, "
+                    f"LR={current_lr:.2e}"
+                )
+            else:
+                logging.info(
+                    f"Epoch {epoch}: "
+                    f"Train MAE={train_loss:.3f}, "
+                    f"Val MAE={val_loss:.3f}, "
+                    f"LR={current_lr:.2e}"
+                )
+
             # Save checkpoint
             is_best = val_loss < self.best_val_loss
             if is_best:
                 self.best_val_loss = val_loss
             self.save_checkpoint(epoch, is_best=is_best)
-            
+
             # Early stopping check
             self.early_stopping(val_loss)
             if self.early_stopping.early_stop:
                 logging.info("")
                 logging.info("=" * 60)
                 logging.info(f"Early stopping at epoch {epoch}")
-                logging.info(f"Best validation MAE: {self.best_val_loss:.3f}")
+                logging.info(f"Best validation loss: {self.best_val_loss:.3f}")
                 logging.info("=" * 60)
                 break
-        
+
         # Save training history
         self._save_training_history()
     
-    def test(self) -> float:
+    def test(self) -> Dict[str, float]:
         """Evaluate on test set using best model"""
         logging.info("")
         logging.info("=" * 60)
         logging.info("Testing")
         logging.info("=" * 60)
-        
+
         # Load best checkpoint
         best_checkpoint = self.checkpoint_dir / "best_checkpoint.pt"
         if not best_checkpoint.exists():
@@ -465,37 +721,58 @@ class BrainAgeTrainer:
                 f"Best checkpoint not found: {best_checkpoint}\n"
                 f"Suggestion: Complete training first."
             )
-        
+
         checkpoint = torch.load(best_checkpoint, map_location=self.device)
         self.model.load_state_dict(checkpoint['model_state_dict'])
         logging.info(f"Loaded best model from epoch {checkpoint['epoch']}")
-        
+
         # Evaluate
-        test_loss = self.evaluate(self.test_loader)
-        logging.info(f"Test MAE: {test_loss:.3f} years")
-        
+        test_metrics = self.evaluate(self.test_loader)
+        use_multitask = self.predict_gender and self.has_gender_data
+
+        logging.info(f"Test Age MAE: {test_metrics['age_loss']:.3f} years")
+        if use_multitask:
+            logging.info(f"Test Gender Accuracy: {test_metrics.get('gender_acc', 0)*100:.1f}%")
+
         # Save test results
         results = {
             'best_epoch': checkpoint['epoch'],
             'best_val_loss': checkpoint['best_val_loss'],
-            'test_loss': test_loss,
+            'test_total_loss': test_metrics['total_loss'],
+            'test_age_mae': test_metrics['age_loss'],
         }
-        
+
+        if use_multitask:
+            results['test_gender_loss'] = test_metrics.get('gender_loss', 0)
+            results['test_gender_accuracy'] = test_metrics.get('gender_acc', 0)
+
         with open(self.output_dir / "test_results.json", 'w') as f:
             json.dump(results, f, indent=2)
-        
+
         logging.info(f"Test results saved to {self.output_dir / 'test_results.json'}")
-        
-        return test_loss
+
+        return test_metrics
     
     def _save_training_history(self) -> None:
         """Save training history to CSV"""
-        history_df = pd.DataFrame({
+        use_multitask = self.predict_gender and self.has_gender_data
+
+        history_data = {
             'epoch': range(1, len(self.train_losses) + 1),
             'train_loss': self.train_losses,
             'val_loss': self.val_losses,
-        })
-        
+            'train_age_loss': self.train_age_losses,
+            'val_age_loss': self.val_age_losses,
+        }
+
+        if use_multitask:
+            history_data['train_gender_loss'] = self.train_gender_losses
+            history_data['val_gender_loss'] = self.val_gender_losses
+            history_data['train_gender_acc'] = self.train_gender_accs
+            history_data['val_gender_acc'] = self.val_gender_accs
+
+        history_df = pd.DataFrame(history_data)
+
         history_path = self.output_dir / "training_history.csv"
         history_df.to_csv(history_path, index=False)
         logging.info(f"Training history saved to {history_path}")
@@ -549,6 +826,14 @@ def main():
                         help='Number of data loading workers (default: 4)')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed (default: 42)')
+
+    # Multi-task arguments
+    parser.add_argument('--predict_gender', action='store_true', default=True,
+                        help='Enable gender prediction (multi-task learning, default: True)')
+    parser.add_argument('--no_gender', action='store_true',
+                        help='Disable gender prediction (age-only mode)')
+    parser.add_argument('--gender_loss_weight', type=float, default=0.5,
+                        help='Weight for gender classification loss (default: 0.5)')
     
     # Execution arguments
     parser.add_argument('--resume', action='store_true',
@@ -567,6 +852,9 @@ def main():
         format='%(levelname)s: %(message)s'
     )
     
+    # Determine gender prediction mode
+    predict_gender = args.predict_gender and not args.no_gender
+
     # Create trainer
     trainer = BrainAgeTrainer(
         train_csv=args.train_csv,
@@ -583,6 +871,8 @@ def main():
         early_stopping_patience=args.early_stopping_patience,
         lr_scheduler_patience=args.lr_scheduler_patience,
         seed=args.seed,
+        predict_gender=predict_gender,
+        gender_loss_weight=args.gender_loss_weight,
     )
     
     # Run

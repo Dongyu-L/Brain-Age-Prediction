@@ -37,7 +37,7 @@ from datetime import datetime
 
 class UniversalSplitter:
     """Universal dataset splitter with stratification support"""
-    
+
     def __init__(
         self,
         input_csv: str,
@@ -46,6 +46,7 @@ class UniversalSplitter:
         val_ratio: float = 0.2,
         test_ratio: float = 0.2,
         stratify_age: bool = False,
+        stratify_gender: bool = False,
         age_bins: int = 5,
         seed: int = 42,
         require_complete: bool = True,
@@ -58,6 +59,7 @@ class UniversalSplitter:
             val_ratio: Validation set ratio (default: 0.2)
             test_ratio: Test set ratio (default: 0.2)
             stratify_age: Whether to stratify by age groups
+            stratify_gender: Whether to stratify by gender
             age_bins: Number of age bins for stratification
             seed: Random seed for reproducibility
             require_complete: Only include subjects with all preprocessed modalities
@@ -68,13 +70,15 @@ class UniversalSplitter:
         self.val_ratio = val_ratio
         self.test_ratio = test_ratio
         self.stratify_age = stratify_age
+        self.stratify_gender = stratify_gender
         self.age_bins = age_bins
         self.seed = seed
         self.require_complete = require_complete
-        
+
         self.df: Optional[pd.DataFrame] = None
         self.preprocessed_cols: List[str] = []
-        
+        self.has_gender: bool = False
+
         # Validate ratios
         total_ratio = train_ratio + val_ratio + test_ratio
         if not np.isclose(total_ratio, 1.0):
@@ -139,13 +143,13 @@ class UniversalSplitter:
     def _validate_data(self) -> None:
         """Validate data quality"""
         logging.info("Validating data...")
-        
+
         # Find preprocessed path columns
         self.preprocessed_cols = [
-            col for col in self.df.columns 
+            col for col in self.df.columns
             if col.endswith('_preprocessed_path')
         ]
-        
+
         if not self.preprocessed_cols:
             raise ValueError(
                 f"No preprocessed path columns found in CSV.\n"
@@ -153,7 +157,7 @@ class UniversalSplitter:
                 f"Available columns: {list(self.df.columns)}\n"
                 f"Suggestion: Ensure CSV was created by data_preprocessor.py"
             )
-        
+
         logging.info(f"  Found {len(self.preprocessed_cols)} preprocessed modalities:")
         for col in self.preprocessed_cols:
             modality = col.replace('_preprocessed_path', '')
@@ -161,26 +165,45 @@ class UniversalSplitter:
             n_complete = ((self.df[col] != '') & (~self.df[col].isna())).sum()
             pct = 100 * n_complete / len(self.df)
             logging.info(f"    {modality}: {n_complete}/{len(self.df)} ({pct:.1f}%)")
-        
-        # Validate ages
-        invalid_ages = self.df[
-            (self.df['Age'] < 0) | 
-            (self.df['Age'] > 120) | 
-            (self.df['Age'].isna())
-        ]
-        
-        if len(invalid_ages) > 0:
+
+        # Check for gender column
+        self.has_gender = 'Gender' in self.df.columns
+        if self.has_gender:
+            n_valid_gender = (self.df['Gender'] >= 0).sum()
+            n_male = (self.df['Gender'] == 1).sum()
+            n_female = (self.df['Gender'] == 0).sum()
+            logging.info(f"  Gender data available: {n_valid_gender}/{len(self.df)}")
+            logging.info(f"    Male: {n_male}, Female: {n_female}")
+            if self.stratify_gender and n_valid_gender == 0:
+                logging.warning("Gender stratification requested but no valid gender data found. "
+                              "Falling back to age-only stratification.")
+                self.stratify_gender = False
+        elif self.stratify_gender:
+            logging.warning("Gender stratification requested but Gender column not found. "
+                          "Falling back to age-only stratification.")
+            self.stratify_gender = False
+
+        # Validate ages (warn but don't filter - allow missing ages for inference)
+        missing_ages = self.df['Age'].isna().sum()
+        out_of_range = ((self.df['Age'] < 0) | (self.df['Age'] > 120)).sum()
+
+        if missing_ages > 0:
             logging.warning(
-                f"Found {len(invalid_ages)} subjects with invalid ages. "
-                f"These will be excluded."
+                f"Found {missing_ages} subjects with missing ages. "
+                f"These will be kept for inference but excluded from stratification."
             )
-            # Remove invalid ages
-            self.df = self.df[
-                (self.df['Age'] >= 0) & 
-                (self.df['Age'] <= 120) & 
-                (~self.df['Age'].isna())
-            ]
-            logging.info(f"  Remaining subjects: {len(self.df)}")
+        if out_of_range > 0:
+            logging.warning(
+                f"Found {out_of_range} subjects with out-of-range ages (not in 0-120). "
+            )
+
+        # Count subjects with valid ages for reference
+        valid_ages = self.df[
+            (self.df['Age'] >= 0) &
+            (self.df['Age'] <= 120) &
+            (~self.df['Age'].isna())
+        ]
+        logging.info(f"  Subjects with valid ages: {len(valid_ages)}/{len(self.df)}")
     
     def _filter_subjects(self) -> None:
         """Filter subjects based on requirements"""
@@ -224,11 +247,12 @@ class UniversalSplitter:
         logging.info(f"  Ratios: train={self.train_ratio}, val={self.val_ratio}, test={self.test_ratio}")
         logging.info(f"  Random seed: {self.seed}")
         logging.info(f"  Stratify by age: {self.stratify_age}")
-        
+        logging.info(f"  Stratify by gender: {self.stratify_gender}")
+
         # Set random seed
         np.random.seed(self.seed)
-        
-        if self.stratify_age:
+
+        if self.stratify_age or self.stratify_gender:
             return self._stratified_split()
         else:
             return self._random_split()
@@ -260,54 +284,104 @@ class UniversalSplitter:
         }
     
     def _stratified_split(self) -> Dict[str, pd.DataFrame]:
-        """Stratified split by age groups"""
-        logging.info(f"  Using {self.age_bins} age bins for stratification")
-        
-        # Create age bins
-        self.df['age_bin'] = pd.cut(
-            self.df['Age'],
-            bins=self.age_bins,
-            labels=False,
-            duplicates='drop'
-        )
-        
+        """Stratified split by age groups and/or gender"""
+        strat_cols = []
+
+        # Create age bins if stratifying by age
+        if self.stratify_age:
+            logging.info(f"  Using {self.age_bins} age bins for stratification")
+            self.df['age_bin'] = pd.cut(
+                self.df['Age'],
+                bins=self.age_bins,
+                labels=False,
+                duplicates='drop'
+            )
+            strat_cols.append('age_bin')
+
+        # Use gender for stratification if available
+        if self.stratify_gender and self.has_gender:
+            logging.info("  Using gender for stratification")
+            # Create gender bin (only valid genders)
+            self.df['gender_bin'] = self.df['Gender'].apply(
+                lambda x: int(x) if x >= 0 else -1
+            )
+            strat_cols.append('gender_bin')
+
+        # Create combined stratification key
+        if len(strat_cols) > 1:
+            self.df['strat_key'] = self.df[strat_cols].apply(
+                lambda x: '_'.join(str(v) for v in x), axis=1
+            )
+        elif len(strat_cols) == 1:
+            self.df['strat_key'] = self.df[strat_cols[0]].astype(str)
+        else:
+            # Fallback to random split
+            return self._random_split()
+
         # Initialize split dataframes
         train_dfs = []
         val_dfs = []
         test_dfs = []
-        
-        # Split within each age bin
-        for bin_idx in self.df['age_bin'].unique():
-            if pd.isna(bin_idx):
+
+        # Split within each stratification group
+        for strat_key in self.df['strat_key'].unique():
+            if pd.isna(strat_key) or '-1' in str(strat_key) or 'nan' in str(strat_key).lower():
+                # Handle subjects with unknown gender/age separately (put in random split)
                 continue
-            
-            bin_df = self.df[self.df['age_bin'] == bin_idx]
-            subject_ids = bin_df['ID'].unique().tolist()
+
+            group_df = self.df[self.df['strat_key'] == strat_key]
+            subject_ids = group_df['ID'].unique().tolist()
             np.random.shuffle(subject_ids)
-            
+
             n_total = len(subject_ids)
             n_train = max(1, int(n_total * self.train_ratio))
             n_val = max(0, int(n_total * self.val_ratio))
-            
+
             # Ensure at least some subjects in each split if possible
             if n_total >= 3:
                 n_val = max(1, n_val)
-            
+
             # Split IDs
             train_ids = subject_ids[:n_train]
             val_ids = subject_ids[n_train:n_train + n_val]
             test_ids = subject_ids[n_train + n_val:]
-            
+
             # Add to split dataframes
-            train_dfs.append(bin_df[bin_df['ID'].isin(train_ids)])
-            val_dfs.append(bin_df[bin_df['ID'].isin(val_ids)])
-            test_dfs.append(bin_df[bin_df['ID'].isin(test_ids)])
-        
-        # Concatenate all bins
-        train_df = pd.concat(train_dfs, ignore_index=True).drop('age_bin', axis=1)
-        val_df = pd.concat(val_dfs, ignore_index=True).drop('age_bin', axis=1)
-        test_df = pd.concat(test_dfs, ignore_index=True).drop('age_bin', axis=1)
-        
+            train_dfs.append(group_df[group_df['ID'].isin(train_ids)])
+            val_dfs.append(group_df[group_df['ID'].isin(val_ids)])
+            test_dfs.append(group_df[group_df['ID'].isin(test_ids)])
+
+        # Handle subjects with unknown stratification (e.g., unknown gender or missing age)
+        unknown_mask = (
+            self.df['strat_key'].isna() |
+            self.df['strat_key'].str.contains('-1', na=False) |
+            self.df['strat_key'].str.contains('nan', case=False, na=False)
+        )
+        if unknown_mask.sum() > 0:
+            unknown_df = self.df[unknown_mask]
+            subject_ids = unknown_df['ID'].unique().tolist()
+            np.random.shuffle(subject_ids)
+
+            n_total = len(subject_ids)
+            n_train = max(1, int(n_total * self.train_ratio))
+            n_val = max(0, int(n_total * self.val_ratio))
+
+            train_ids = subject_ids[:n_train]
+            val_ids = subject_ids[n_train:n_train + n_val]
+            test_ids = subject_ids[n_train + n_val:]
+
+            train_dfs.append(unknown_df[unknown_df['ID'].isin(train_ids)])
+            val_dfs.append(unknown_df[unknown_df['ID'].isin(val_ids)])
+            test_dfs.append(unknown_df[unknown_df['ID'].isin(test_ids)])
+
+        # Concatenate all groups
+        cols_to_drop = ['age_bin', 'gender_bin', 'strat_key']
+        cols_to_drop = [c for c in cols_to_drop if c in self.df.columns]
+
+        train_df = pd.concat(train_dfs, ignore_index=True).drop(columns=cols_to_drop, errors='ignore')
+        val_df = pd.concat(val_dfs, ignore_index=True).drop(columns=cols_to_drop, errors='ignore')
+        test_df = pd.concat(test_dfs, ignore_index=True).drop(columns=cols_to_drop, errors='ignore')
+
         return {
             'train': train_df,
             'val': val_df,
@@ -369,47 +443,95 @@ class UniversalSplitter:
         logging.info("=" * 60)
         logging.info("SPLIT SUMMARY")
         logging.info("=" * 60)
-        
+
         total_subjects = sum(len(df) for df in splits.values())
-        
+
         for split_name in ['train', 'val', 'test']:
             split_df = splits[split_name]
             n_subjects = len(split_df)
             pct = 100 * n_subjects / total_subjects if total_subjects > 0 else 0
-            
-            age_mean = split_df['Age'].mean()
-            age_std = split_df['Age'].std()
-            age_min = split_df['Age'].min()
-            age_max = split_df['Age'].max()
-            
+
+            # Count subjects with valid ages
+            valid_ages = split_df['Age'].dropna()
+            n_with_age = len(valid_ages)
+            n_without_age = n_subjects - n_with_age
+
             logging.info(f"\n{split_name.upper()}:")
             logging.info(f"  Subjects: {n_subjects} ({pct:.1f}%)")
-            logging.info(f"  Age: {age_mean:.1f} ± {age_std:.1f} (range: {age_min:.1f}-{age_max:.1f})")
-        
+
+            if n_with_age > 0:
+                age_mean = valid_ages.mean()
+                age_std = valid_ages.std()
+                age_min = valid_ages.min()
+                age_max = valid_ages.max()
+                logging.info(f"  Age (n={n_with_age}): {age_mean:.1f} ± {age_std:.1f} (range: {age_min:.1f}-{age_max:.1f})")
+            if n_without_age > 0:
+                logging.info(f"  Subjects without age: {n_without_age}")
+
+            # Gender statistics if available
+            if self.has_gender and 'Gender' in split_df.columns:
+                n_male = (split_df['Gender'] == 1).sum()
+                n_female = (split_df['Gender'] == 0).sum()
+                n_unknown = (split_df['Gender'] < 0).sum()
+                logging.info(f"  Gender: Male={n_male}, Female={n_female}, Unknown={n_unknown}")
+
         logging.info("")
         logging.info(f"Total subjects: {total_subjects}")
         logging.info("=" * 60)
-        
+
         # Check for age distribution balance
         if self.stratify_age:
             self._check_stratification_quality(splits)
+
+        # Check for gender distribution balance
+        if self.stratify_gender and self.has_gender:
+            self._check_gender_stratification_quality(splits)
+
+    def _check_gender_stratification_quality(self, splits: Dict[str, pd.DataFrame]) -> None:
+        """Check if gender stratification worked well"""
+        logging.info("\nGender distribution check:")
+
+        gender_ratios = []
+        for split_name, split_df in splits.items():
+            if 'Gender' not in split_df.columns:
+                continue
+            n_male = (split_df['Gender'] == 1).sum()
+            n_female = (split_df['Gender'] == 0).sum()
+            n_total = n_male + n_female
+            if n_total > 0:
+                male_ratio = n_male / n_total
+                gender_ratios.append(male_ratio)
+                logging.info(f"  {split_name}: Male ratio = {male_ratio*100:.1f}%")
+
+        # Calculate variance between splits
+        if len(gender_ratios) > 1:
+            variance = np.var(gender_ratios)
+            if variance < 0.01:
+                logging.info(f"  Stratification quality: GOOD (variance={variance:.4f})")
+            else:
+                logging.warning(f"  Stratification quality: MODERATE (variance={variance:.4f})")
     
     def _check_stratification_quality(self, splits: Dict[str, pd.DataFrame]) -> None:
         """Check if stratification worked well"""
-        logging.info("\nAge distribution check:")
-        
+        logging.info("\nAge distribution check (subjects with valid ages only):")
+
+        means = []
         for split_name, split_df in splits.items():
-            mean_age = split_df['Age'].mean()
-            logging.info(f"  {split_name}: mean age = {mean_age:.2f}")
-        
+            valid_ages = split_df['Age'].dropna()
+            if len(valid_ages) > 0:
+                mean_age = valid_ages.mean()
+                means.append(mean_age)
+                logging.info(f"  {split_name}: mean age = {mean_age:.2f} (n={len(valid_ages)})")
+            else:
+                logging.info(f"  {split_name}: no valid ages")
+
         # Calculate variance between splits
-        means = [df['Age'].mean() for df in splits.values()]
-        variance = np.var(means)
-        
-        if variance < 1.0:
-            logging.info(f"  Stratification quality: GOOD (variance={variance:.2f})")
-        else:
-            logging.warning(f"  Stratification quality: MODERATE (variance={variance:.2f})")
+        if len(means) > 1:
+            variance = np.var(means)
+            if variance < 1.0:
+                logging.info(f"  Stratification quality: GOOD (variance={variance:.2f})")
+            else:
+                logging.warning(f"  Stratification quality: MODERATE (variance={variance:.2f})")
 
 
 def main():
@@ -463,6 +585,8 @@ Examples:
     # Stratification options
     parser.add_argument('--stratify_age', action='store_true',
                         help='Stratify splits by age groups (recommended for brain age)')
+    parser.add_argument('--stratify_gender', action='store_true',
+                        help='Stratify splits by gender (ensures balanced gender distribution)')
     parser.add_argument('--age_bins', type=int, default=5,
                         help='Number of age bins for stratification (default: 5)')
     
@@ -498,6 +622,7 @@ Examples:
         val_ratio=args.ratios[1],
         test_ratio=args.ratios[2],
         stratify_age=args.stratify_age,
+        stratify_gender=args.stratify_gender,
         age_bins=args.age_bins,
         seed=args.seed,
         require_complete=not args.no_require_complete,
