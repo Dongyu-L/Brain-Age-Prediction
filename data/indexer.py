@@ -54,6 +54,12 @@ class UniversalIndexer:
     # Valid image extensions
     IMAGE_EXTENSIONS = ['.nii', '.nii.gz', '.nrrd', '.mha', '.mhd']
     
+    # Modality patterns in filenames (case-insensitive)
+    MODALITY_PATTERNS = {
+        'T1': [r'T1', r'_T1', r'T1_', r'T1w_', r'-T1', r'T1-', r'T1w-'],
+        'T2': [r'T2', r'_T2', r'T2_', r'T2w_', r'-T2', r'T2-', r'T2w-'],
+    }
+    
     def __init__(self,
                  metadata_file: str,
                  image_roots: Dict[str, str],
@@ -62,7 +68,8 @@ class UniversalIndexer:
                  min_age: float = 0.0,
                  max_age: float = 120.0,
                  require_all_modalities: bool = False,
-                 extract_gender: bool = True):
+                 extract_gender: bool = True,
+                 allow_mixed_modalities: bool = False):
         """
         Args:
             metadata_file: Path to metadata file (Excel/CSV/TSV/JSON)
@@ -73,6 +80,7 @@ class UniversalIndexer:
             max_age: Maximum valid age
             require_all_modalities: If True, only include subjects with all modalities
             extract_gender: Whether to extract gender information from metadata
+            allow_mixed_modalities: If True, allow multiple modalities in the same folder
         """
         self.metadata_file = Path(metadata_file)
         self.image_roots = {k: Path(v) for k, v in image_roots.items()}
@@ -82,6 +90,7 @@ class UniversalIndexer:
         self.max_age = max_age
         self.require_all_modalities = require_all_modalities
         self.extract_gender = extract_gender
+        self.allow_mixed_modalities = allow_mixed_modalities
 
         self.metadata_df: Optional[pd.DataFrame] = None
         self.id_col: Optional[str] = None
@@ -256,12 +265,12 @@ class UniversalIndexer:
         
         return image_maps
     
-    def _scan_image_directory(self, root: Path) -> Dict[str, str]:
+    def _scan_mixed_modalities(self, root: Path) -> Dict[str, Dict[str, str]]:
         """
-        Recursively scan directory for images and build ID->path mapping.
-        Returns dict with multiple ID variants as keys pointing to same path.
+        Scan a directory for multiple modalities and separate them based on filename patterns.
+        Returns dict of modality -> {id_variant: path}
         """
-        file_map = {}
+        file_maps = {mod: {} for mod in self.MODALITY_PATTERNS.keys()}
         
         # Find all image files
         if self.recursive:
@@ -273,10 +282,27 @@ class UniversalIndexer:
             for ext in self.IMAGE_EXTENSIONS:
                 image_files.extend(root.glob(f'*{ext}'))
         
-        logging.info(f"  Found {len(image_files)} image files")
+        logging.info(f"  Found {len(image_files)} total image files")
         
-        # Extract IDs from filenames
+        # Classify each file by modality
         for img_path in image_files:
+            filename = img_path.name.lower()
+            
+            # Determine modality from filename
+            detected_modality = None
+            for modality, patterns in self.MODALITY_PATTERNS.items():
+                for pattern in patterns:
+                    if pattern.lower() in filename:
+                        detected_modality = modality
+                        break
+                if detected_modality:
+                    break
+            
+            if not detected_modality:
+                logging.debug(f"  Could not determine modality for: {img_path.name}")
+                continue
+            
+            # Extract ID from filename
             extracted_id = self._extract_id_from_filename(img_path.name)
             
             if not extracted_id:
@@ -286,12 +312,12 @@ class UniversalIndexer:
             # Generate ID variants for robust matching
             id_variants = self._generate_id_variants(extracted_id)
             
-            # Map all variants to this file path
+            # Map all variants to this file path for this modality
             for variant in id_variants:
-                if variant not in file_map:
-                    file_map[variant] = str(img_path)
+                if variant not in file_maps[detected_modality]:
+                    file_maps[detected_modality][variant] = str(img_path)
         
-        return file_map
+        return file_maps
     
     def _extract_id_from_filename(self, filename: str) -> Optional[str]:
         """Try multiple patterns to extract ID from filename"""

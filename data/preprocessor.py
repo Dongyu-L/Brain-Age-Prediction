@@ -5,26 +5,42 @@ A flexible preprocessing pipeline that works with any dataset structure.
 Performs N4 bias correction and registration to standard template space.
 
 Usage:
-    # Basic usage
+    # Basic usage (auto-detect modalities)
     python data_preprocessor.py \
-        --input_csv raw_index.csv \
+        --input_csv IXI_index.csv \
         --output_dir preprocessed \
         --template MNI152_T1_1mm.nii.gz
     
     # Multi-modality with specific columns
     python data_preprocessor.py \
-        --input_csv raw_index.csv \
+        --input_csv IXI_index.csv \
         --output_dir preprocessed \
         --template MNI152_T1_1mm.nii.gz \
         --modalities T1 T2
     
     # Process subset (useful for batch processing)
     python data_preprocessor.py \
-        --input_csv raw_index.csv \
+        --input_csv IXI_index.csv \
         --output_dir preprocessed \
         --template MNI152_T1_1mm.nii.gz \
         --start_row 0 \
         --end_row 100
+
+Output Structure:
+    preprocessed/
+    ├── IXI/                    # Dataset name from CSV filename
+    │   ├── T1/                 # All T1 images for IXI dataset
+    │   │   ├── 001_T1_MNI.nii.gz
+    │   │   ├── 002_T1_MNI.nii.gz
+    │   │   └── ...
+    │   ├── T2/                 # All T2 images for IXI dataset
+    │   │   ├── 001_T2_MNI.nii.gz
+    │   │   └── ...
+    │   ├── metadata/           # Processing metadata
+    │   │   ├── 001_metadata.json
+    │   │   └── ...
+    │   └── IXI_preprocessed_index.csv  # Updated CSV with output paths
+    └── logs/                   # Processing logs
 """
 
 import argparse
@@ -71,6 +87,9 @@ class UniversalPreprocessor:
         self.n4_iterations = n4_iterations
         self.skip_existing = skip_existing
         self.save_intermediate = save_intermediate
+        
+        # Extract dataset name from CSV filename (e.g., 'IXI_index.csv' -> 'IXI')
+        self.dataset_name = self.input_csv.stem.split('_')[0]
         
         self.df: Optional[pd.DataFrame] = None
         self.template_img: Optional[ants.ANTsImage] = None
@@ -277,12 +296,8 @@ class UniversalPreprocessor:
         """
         subject_id = str(row['ID'])
         
-        # Create subject output directory
-        subj_dir = self.output_dir / subject_id
-        subj_dir.mkdir(exist_ok=True)
-        
-        # Check if already processed
-        if self.skip_existing and self._is_subject_complete(subj_dir, subject_id):
+        # Check if already processed (check all modalities)
+        if self.skip_existing and self._is_subject_complete(subject_id):
             logging.info(f"[{idx}] {subject_id}: Already processed, skipping")
             return False
         
@@ -308,13 +323,12 @@ class UniversalPreprocessor:
             # Run preprocessing pipeline
             self._preprocess_single_image(
                 img_path=img_path,
-                output_dir=subj_dir,
                 subject_id=subject_id,
                 modality=modality,
             )
         
         # Save processing metadata
-        self._save_metadata(subj_dir, subject_id, row)
+        self._save_metadata(subject_id, row)
         
         return True
     
@@ -389,16 +403,30 @@ class UniversalPreprocessor:
         ants.image_write(img_registered, str(final_output))
         logging.info(f"    - Saved: {final_output.name}")
     
-    def _is_subject_complete(self, subj_dir: Path, subject_id: str) -> bool:
+    def _is_subject_complete(self, subject_id: str) -> bool:
         """Check if subject has already been processed"""
         for modality in self.modalities:
-            expected_file = subj_dir / f"{subject_id}_{modality}_MNI.nii.gz"
+            expected_file = self.output_dir / self.dataset_name / modality / f"{subject_id}_{modality}_MNI.nii.gz"
             if not expected_file.exists():
                 return False
         return True
     
-    def _save_metadata(self, subj_dir: Path, subject_id: str, row: pd.Series) -> None:
+    def _save_metadata(self, subject_id: str, row: pd.Series) -> None:
         """Save processing metadata for this subject"""
+        metadata_dir = self.output_dir / self.dataset_name / "metadata"
+        metadata_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Build output paths for each modality
+        output_paths = {}
+        for modality in self.modalities:
+            n4_path = self.output_dir / self.dataset_name / modality / f"{subject_id}_{modality}_N4.nii.gz"
+            mni_path = self.output_dir / self.dataset_name / modality / f"{subject_id}_{modality}_MNI.nii.gz"
+            
+            output_paths[modality] = {
+                'n4_corrected': str(n4_path) if self.save_intermediate and n4_path.exists() else None,
+                'mni_registered': str(mni_path) if mni_path.exists() else None,
+            }
+        
         metadata = {
             'subject_id': subject_id,
             'age': float(row['Age']),
@@ -407,9 +435,11 @@ class UniversalPreprocessor:
             'registration_type': self.registration_type,
             'modalities': self.modalities,
             'n4_iterations': self.n4_iterations,
+            'dataset': self.dataset_name,
+            'output_paths': output_paths,
         }
         
-        metadata_file = subj_dir / f"{subject_id}_metadata.json"
+        metadata_file = metadata_dir / f"{subject_id}_metadata.json"
         with open(metadata_file, 'w') as f:
             json.dump(metadata, f, indent=2)
     
